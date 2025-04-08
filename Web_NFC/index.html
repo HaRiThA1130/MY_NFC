@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NFC + Face Verification Attendance</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .status-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        .present { background-color: #d1fae5; color: #065f46; }
+        .proxy { background-color: #fee2e2; color: #991b1b; }
+        #cameraModal {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 1000;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 20px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold">Attendance System</h1>
+            <p id="status" class="text-gray-600 mt-2">Ready to scan</p>
+        </div>
+
+        <!-- Controls -->
+        <div class="flex justify-center gap-4 mb-8">
+            <button id="startScan" class="bg-blue-500 text-white px-6 py-2 rounded hover:bg-blue-600">
+                Start NFC Scan
+            </button>
+        </div>
+
+        <!-- Camera Modal -->
+        <div id="cameraModal">
+            <video id="video" width="1920" height="1080" autoplay></video>
+            <canvas id="canvas" style="display: none;"></canvas>
+            <p id="verificationStatus" class="text-white text-center mt-2">Verifying...</p>
+        </div>
+
+        <!-- Attendance Table -->
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+            <table class="min-w-full">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Time</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                    </tr>
+                </thead>
+                <tbody id="attendanceLog">
+                    <!-- Attendance entries will be added here -->
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Add this section just before closing the container div -->
+        <div class="mt-8 bg-white rounded-lg shadow p-4">
+            <h2 class="text-xl font-bold mb-4">Debug Information</h2>
+            <div class="space-y-4">
+                <div>
+                    <h3 class="text-lg font-semibold">Current NFC ID:</h3>
+                    <pre id="nfcDebug" class="bg-gray-100 p-2 rounded">-</pre>
+                </div>
+                <div>
+                    <h3 class="text-lg font-semibold">API Response:</h3>
+                    <pre id="apiDebug" class="bg-gray-100 p-2 rounded overflow-x-auto whitespace-pre-wrap">-</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        // Firebase Configuration
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js";
+        import { getFirestore, doc, setDoc } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDz8GmEYaZPymSTowedSKUsj_naF7JTfXw",
+            authDomain: "kare-attendance-system-9fe72.firebaseapp.com",
+            projectId: "kare-attendance-system-9fe72",
+            storageBucket: "kare-attendance-system-9fe72.appspot.com",
+            messagingSenderId: "148380211452",
+            appId: "1:148380211452:web:72ba700a4ca285f74b1f79"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        // Global variables
+        let isProcessing = false;
+        let currentNfcId = null;
+        let stream = null;
+
+        // DOM Elements
+        const startButton = document.getElementById('startScan');
+        const status = document.getElementById('status');
+        const cameraModal = document.getElementById('cameraModal');
+        const video = document.getElementById('video');
+        const verificationStatus = document.getElementById('verificationStatus');
+
+        // Start NFC scanning
+        startButton.addEventListener('click', async () => {
+            if (!('NDEFReader' in window)) {
+                status.textContent = 'NFC not supported';
+                return;
+            }
+
+            try {
+                const ndef = new NDEFReader();
+                await ndef.scan();
+                status.textContent = 'Scanning for NFC...';
+
+                ndef.addEventListener("reading", async ({ message }) => {
+                    if (isProcessing) return;
+                    isProcessing = true;
+
+                    try {
+                        const textDecoder = new TextDecoder();
+                        currentNfcId = textDecoder.decode(message.records[0].data);
+                        status.textContent = `NFC ID: ${currentNfcId}`;
+                        await startVerification();
+                    } catch (error) {
+                        console.error('NFC reading error:', error);
+                        status.textContent = 'Error reading NFC';
+                        isProcessing = false;
+                    }
+                });
+            } catch (error) {
+                console.error('NFC initialization error:', error);
+                status.textContent = 'Error initializing NFC';
+            }
+        });
+
+        // Start face verification process
+        async function startVerification() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                video.srcObject = stream;
+                cameraModal.style.display = 'block';
+
+                // Wait 3 seconds before taking photo
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                await verifyFace();
+            } catch (error) {
+                console.error('Camera error:', error);
+                verificationStatus.textContent = 'Camera error';
+                cleanup();
+            }
+        }
+
+        // Verify face using server
+        async function verifyFace() {
+            const canvas = document.getElementById('canvas');
+            canvas.width = 1920;
+            canvas.height = 1080;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+
+            // Update NFC debug info
+            document.getElementById('nfcDebug').textContent = currentNfcId || 'No NFC ID';
+
+            try {
+                const response = await fetch('https://ourattendance.xyz/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        image: canvas.toDataURL('image/jpeg'),
+                        nfc_id: currentNfcId
+                    })
+                });
+
+                const result = await response.json();
+                
+                // Update API debug info
+                document.getElementById('apiDebug').textContent = 
+                    JSON.stringify(result, null, 2);
+
+                if (result.success && result.detected_persons && result.detected_persons.length > 0) {
+                    const detectedId = String(result.detected_persons[0].class);
+                    const nfcIdString = String(currentNfcId);
+                    
+                    console.log('Detected ID:', detectedId);
+                    console.log('NFC ID:', nfcIdString);
+                    
+                    const isMatch = detectedId === nfcIdString;
+                    verificationStatus.textContent = isMatch ? 'Present ✅' : 'Possible Proxy ❌';
+                    await processAttendance(isMatch);
+                } else {
+                    verificationStatus.textContent = 'No person detected';
+                    await processAttendance(false);
+                }
+            } catch (error) {
+                console.error('Verification error:', error);
+                verificationStatus.textContent = 'Verification failed';
+                await processAttendance(false);
+            }
+        }
+
+        // Process attendance result
+        async function processAttendance(isMatch) {
+            const timestamp = new Date();
+            const status = isMatch ? 'present' : 'proxy';
+
+            // Save to Firebase with additional details
+            try {
+                await setDoc(doc(db, "attendance", `${currentNfcId}_${timestamp.getTime()}`), {
+                    nfc_id: currentNfcId,
+                    timestamp: timestamp.toISOString(),
+                    status: status,
+                    verification_status: isMatch ? 'id_match' : 'id_mismatch'
+                });
+
+                // Update UI
+                updateAttendanceLog(currentNfcId, timestamp, status);
+            } catch (error) {
+                console.error('Firebase error:', error);
+                verificationStatus.textContent = 'Error saving attendance';
+            }
+
+            // Delay cleanup to show status
+            setTimeout(cleanup, 6000);
+        }
+
+        // Update attendance log in UI
+        function updateAttendanceLog(id, timestamp, status) {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td class="px-6 py-4">${id}</td>
+                <td class="px-6 py-4">${timestamp.toLocaleTimeString()}</td>
+                <td class="px-6 py-4">
+                    <span class="status-badge ${status === 'present' ? 'present' : 'proxy'}">
+                        ${status === 'present' ? 'Present ✅' : 'Possible Proxy ❌'}
+                    </span>
+                </td>
+            `;
+            document.getElementById('attendanceLog').prepend(row);
+        }
+
+        // Cleanup function
+        function cleanup() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            cameraModal.style.display = 'none';
+            currentNfcId = null;
+            isProcessing = false;
+            status.textContent = 'Ready to scan';
+            
+            // Clear debug info after delay
+            setTimeout(() => {
+                document.getElementById('nfcDebug').textContent = '-';
+                document.getElementById('apiDebug').textContent = '-';
+            }, 5000);  // Clear after 5 seconds
+        }
+    </script>
+</body>
+</html>
